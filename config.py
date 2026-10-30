@@ -32,8 +32,14 @@ NOTIFY_ONLY_MONTHS = [
     (1, 2027),
 ]
 
-# Polling / timing settings (in seconds)
-POLL_INTERVAL_SECONDS = 4.0
+# Rate limit & polling settings:
+# DVSA enforces an hourly limit of ~40 searches (50 total state transitions) per hour.
+# Setting MAX_SEARCHES_PER_HOUR = 36 (~1 search every 100s) spreads attempts evenly
+# across the hour while keeping a reserve quota to complete the booking when a slot drops.
+MAX_SEARCHES_PER_HOUR = 36
+POLL_JITTER_SECONDS = 8.0  # Random +/- seconds added to each wait interval
+SEARCH_LIMIT_COOLDOWN_SECONDS = 900  # 15-minute cooldown if "Search limit reached" modal appears
+
 PAGE_TRANSITION_DELAY = 1.5
 ELEMENT_WAIT_TIMEOUT = 15.0  # Max seconds to wait for calendar / slots / buttons to load
 CLICK_JITTER_PX = 3

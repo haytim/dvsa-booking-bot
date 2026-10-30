@@ -1,10 +1,11 @@
 import argparse
+import collections
 import json
 import random
 import re
 import time
 import winsound
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import pyautogui
 import requests
@@ -14,6 +15,9 @@ import config
 
 # Enable PyAutoGUI fail-safe (if USE_PHYSICAL_MOUSE is enabled)
 pyautogui.FAILSAFE = True
+
+# Rolling 60-minute window of search timestamps
+SEARCH_TIMESTAMPS: Deque[float] = collections.deque()
 
 
 class ChromeCDPBridge:
@@ -292,6 +296,82 @@ def wait_for_security_check_resolution(bridge: ChromeCDPBridge) -> None:
                 return
 
 
+def is_search_limit_reached(bridge: ChromeCDPBridge) -> bool:
+    """Checks if the 'Search limit reached: You've reached the maximum number of searches per hour'
+    modal dialog is currently displayed.
+    """
+    script = """
+    (() => {
+        const okBtn = document.querySelector('#warning-ok, a[href*="dnSearchLimitWarningAck"]');
+        if (okBtn) {
+            const rect = okBtn.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) return true;
+        }
+        const dialogTitle = document.querySelector('#dialog-label');
+        if (dialogTitle && (dialogTitle.innerText || '').toLowerCase().includes('search limit reached')) {
+            return true;
+        }
+        return false;
+    })()
+    """
+    try:
+        return bool(bridge.evaluate(script))
+    except Exception:
+        return False
+
+
+def handle_search_limit_if_present(bridge: ChromeCDPBridge) -> bool:
+    """If the 'Search limit reached' modal is open, clicks 'Ok' to dismiss it and sleeps
+    for `SEARCH_LIMIT_COOLDOWN_SECONDS` so the rolling hourly quota recovers.
+    Returns True if rate limit was hit and handled.
+    """
+    if not is_search_limit_reached(bridge):
+        return False
+
+    print("\n" + "!" * 70)
+    print("[HOURLY LIMIT REACHED] DVSA 'Search limit reached' dialog detected!")
+    ok_coords = bridge.scroll_into_view_and_get_coords(
+        "document.querySelector('#warning-ok, a[href*=\"dnSearchLimitWarningAck\"]')"
+    )
+    if ok_coords:
+        click_target(bridge, ok_coords, label="Search Limit Modal 'Ok'")
+        time.sleep(1.0)
+
+    cooldown = getattr(config, "SEARCH_LIMIT_COOLDOWN_SECONDS", 900)
+    mins = cooldown / 60.0
+    print(f"[COOLDOWN] Pausing searches for {mins:.0f} minutes ({cooldown}s) to let hourly quota reset...")
+    print("!" * 70 + "\n")
+    time.sleep(cooldown)
+    return True
+
+
+def compute_smart_poll_delay() -> float:
+    """Computes the delay before the next search to spread `MAX_SEARCHES_PER_HOUR` evenly
+    across 3600 seconds, accounting for the rolling 60-minute window.
+    """
+    now = time.time()
+    # Prune timestamps older than 3600 seconds (1 hour)
+    while SEARCH_TIMESTAMPS and (now - SEARCH_TIMESTAMPS[0]) > 3600.0:
+        SEARCH_TIMESTAMPS.popleft()
+
+    max_per_hour = max(1, getattr(config, "MAX_SEARCHES_PER_HOUR", 36))
+    base_interval = 3600.0 / max_per_hour  # e.g. 3600 / 36 = 100.0s
+    jitter = getattr(config, "POLL_JITTER_SECONDS", 8.0)
+
+    # If rolling window is already full, wait until the oldest search expires from the 1-hour window
+    if len(SEARCH_TIMESTAMPS) >= max_per_hour:
+        oldest_expiry = (SEARCH_TIMESTAMPS[0] + 3605.0) - now
+        delay = max(base_interval, oldest_expiry) + random.uniform(2.0, jitter)
+    else:
+        delay = max(15.0, base_interval + random.uniform(-jitter, jitter))
+
+    print(
+        f"[Rate Pacer] Rolling hour usage: {len(SEARCH_TIMESTAMPS)}/{max_per_hour} searches "
+        f"| Next search in {delay:.1f}s (~{3600.0 / base_interval:.0f}/hr pace)"
+    )
+    return delay
+
+
 # Matches e.g. "Dundee – available tests around 03/03/2027" (even if the dash is mangled as \ufffd)
 DATE_REGEX = re.compile(
     r"avai?li?able\s+tests\s+around\s+(\d{2})/(\d{2})/(\d{4})",
@@ -302,6 +382,8 @@ DATE_REGEX = re.compile(
 def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) -> bool:
     """Types a postcode/search query into the search input box and clicks 'Find test centres'."""
     wait_for_security_check_resolution(bridge)
+    handle_search_limit_if_present(bridge)
+
     if query is not None:
         input_getter = """
         document.querySelector('#test-centres-input, input[name="testCentreName"], input[type="text"]')
@@ -322,7 +404,6 @@ def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) ->
             pyautogui.press("backspace")
             pyautogui.write(query, interval=0.04)
         else:
-            # Clear input and focus via DOM, then insert characters via CDP Input.insertText
             bridge.evaluate(
                 """
                 (() => {
@@ -353,8 +434,11 @@ def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) ->
             return False
 
     click_target(bridge, btn_coords, label="Find test centres")
+    SEARCH_TIMESTAMPS.append(time.time())
     time.sleep(config.PAGE_TRANSITION_DELAY)
     wait_for_security_check_resolution(bridge)
+    if handle_search_limit_if_present(bridge):
+        return False
     return True
 
 
@@ -597,6 +681,9 @@ def evaluate_date_action(location: str, day: int, month: int, year: int) -> str:
 def check_current_results(bridge: ChromeCDPBridge) -> bool:
     """Scans the currently displayed search results and returns True if a booking flow completed."""
     wait_for_security_check_resolution(bridge)
+    if handle_search_limit_if_present(bridge):
+        return False
+
     matches = scan_locations(bridge)
     for item in matches:
         loc = item["location"]
@@ -638,7 +725,7 @@ def main() -> None:
     bridge.connect()
 
     mode_str = "Physical Mouse (PyAutoGUI)" if getattr(config, "USE_PHYSICAL_MOUSE", False) else "100% Cursor-Free (CDP Native Input)"
-    print(f"[Mode] {mode_str}")
+    print(f"[Mode] {mode_str} | Target Pace: {config.MAX_SEARCHES_PER_HOUR} searches/hour")
 
     if args.test_calendar:
         print("[TEST MODE] Running calendar + time slot + continue flow on current page...")
@@ -652,15 +739,17 @@ def main() -> None:
     while True:
         if config.SEARCH_QUERIES:
             for query in config.SEARCH_QUERIES:
-                run_postcode_search(bridge, query=query)
+                if run_postcode_search(bridge, query=query):
+                    if check_current_results(bridge):
+                        return
+                delay = compute_smart_poll_delay()
+                time.sleep(delay)
+        else:
+            delay = compute_smart_poll_delay()
+            time.sleep(delay)
+            if run_postcode_search(bridge, query=None):
                 if check_current_results(bridge):
                     return
-                time.sleep(config.POLL_INTERVAL_SECONDS)
-        else:
-            time.sleep(config.POLL_INTERVAL_SECONDS)
-            run_postcode_search(bridge, query=None)
-            if check_current_results(bridge):
-                return
 
 
 if __name__ == "__main__":
