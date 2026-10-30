@@ -341,8 +341,39 @@ def handle_search_limit_if_present(bridge: ChromeCDPBridge) -> bool:
     mins = cooldown / 60.0
     print(f"[COOLDOWN] Pausing searches for {mins:.0f} minutes ({cooldown}s) to let hourly quota reset...")
     print("!" * 70 + "\n")
-    time.sleep(cooldown)
+    smart_sleep_with_keepalive(bridge, cooldown)
     return True
+
+
+def smart_sleep_with_keepalive(bridge: ChromeCDPBridge, duration: float) -> None:
+    """Sleeps for `duration` seconds while periodically checking for:
+    - Captcha / security check dialogs
+    - Session timeout warning dialogs (auto-clicking 'Keep me signed in' / 'Continue' if shown)
+    """
+    end_time = time.time() + duration
+    while time.time() < end_time:
+        remaining = end_time - time.time()
+        time.sleep(min(5.0, max(0.1, remaining)))
+        try:
+            if is_security_check_page(bridge):
+                wait_for_security_check_resolution(bridge)
+            # Check for DVSA session timeout warning modal and keep session alive
+            keep_alive_getter = """
+            (() => {
+                const btns = Array.from(document.querySelectorAll('button, a.button, input[type="button"]'));
+                return btns.find(b => {
+                    const rect = b.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) return false;
+                    const txt = (b.innerText || b.value || '').toLowerCase();
+                    return txt.includes('keep') || txt.includes('stay signed in') || txt.includes('extend');
+                }) || null;
+            })()
+            """
+            ka_coords = bridge.scroll_into_view_and_get_coords(keep_alive_getter)
+            if ka_coords:
+                click_target(bridge, ka_coords, label="Session Keep-Alive")
+        except Exception:
+            pass
 
 
 def compute_smart_poll_delay() -> float:
@@ -743,10 +774,10 @@ def main() -> None:
                     if check_current_results(bridge):
                         return
                 delay = compute_smart_poll_delay()
-                time.sleep(delay)
+                smart_sleep_with_keepalive(bridge, delay)
         else:
             delay = compute_smart_poll_delay()
-            time.sleep(delay)
+            smart_sleep_with_keepalive(bridge, delay)
             if run_postcode_search(bridge, query=None):
                 if check_current_results(bridge):
                     return
