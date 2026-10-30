@@ -4,7 +4,7 @@ import random
 import re
 import time
 import winsound
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pyautogui
 import requests
@@ -12,13 +12,13 @@ import websocket
 
 import config
 
-# Enable PyAutoGUI fail-safe (move mouse to any corner of primary monitor to abort)
+# Enable PyAutoGUI fail-safe (if USE_PHYSICAL_MOUSE is enabled)
 pyautogui.FAILSAFE = True
 
 
 class ChromeCDPBridge:
     """Connects to a running Chrome instance via Chrome DevTools Protocol (CDP)
-    to inspect the live DOM and compute exact screen coordinates for PyAutoGUI.
+    to inspect the live DOM and dispatch native browser clicks/typing (or OS coordinates).
     """
 
     def __init__(self, host: str = config.CDP_HOST):
@@ -51,34 +51,87 @@ class ChromeCDPBridge:
         self.ws = websocket.create_connection(ws_url, timeout=10)
         print(f"[CDP] Connected to tab: {page_target.get('title')} ({page_target.get('url')})")
 
-    def evaluate(self, js_expression: str) -> Any:
+    def send_cdp(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Sends a raw CDP command and returns the result payload."""
         if not self.ws:
             raise RuntimeError("WebSocket is not connected.")
         self._msg_id += 1
         payload = {
             "id": self._msg_id,
-            "method": "Runtime.evaluate",
-            "params": {
-                "expression": js_expression,
-                "returnByValue": True,
-                "awaitPromise": True,
-            },
+            "method": method,
+            "params": params or {},
         }
         self.ws.send(json.dumps(payload))
         while True:
             raw = self.ws.recv()
             msg = json.loads(raw)
             if msg.get("id") == self._msg_id:
-                result = msg.get("result", {}).get("result", {})
-                if "value" in result:
-                    return result["value"]
-                return None
+                return msg.get("result", {})
 
-    def scroll_into_view_and_get_screen_coords(
+    def evaluate(self, js_expression: str) -> Any:
+        res = self.send_cdp(
+            "Runtime.evaluate",
+            {
+                "expression": js_expression,
+                "returnByValue": True,
+                "awaitPromise": True,
+            },
+        )
+        result = res.get("result", {})
+        if "value" in result:
+            return result["value"]
+        return None
+
+    def cdp_click_viewport(self, vx: float, vy: float, label: str = "") -> None:
+        """Dispatches a native trusted mouse move + left click inside Chrome at viewport (vx, vy)
+        without moving or stealing the user's OS mouse cursor.
+        """
+        jitter_x = random.uniform(-config.CLICK_JITTER_PX, config.CLICK_JITTER_PX)
+        jitter_y = random.uniform(-config.CLICK_JITTER_PX, config.CLICK_JITTER_PX)
+        tx = round(vx + jitter_x, 1)
+        ty = round(vy + jitter_y, 1)
+        print(f"[CDP Click] Clicking {label} at viewport ({tx}, {ty})")
+
+        self.send_cdp(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseMoved", "x": tx, "y": ty},
+        )
+        time.sleep(0.03)
+        self.send_cdp(
+            "Input.dispatchMouseEvent",
+            {
+                "type": "mousePressed",
+                "x": tx,
+                "y": ty,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+            },
+        )
+        time.sleep(0.04)
+        self.send_cdp(
+            "Input.dispatchMouseEvent",
+            {
+                "type": "mouseReleased",
+                "x": tx,
+                "y": ty,
+                "button": "left",
+                "buttons": 0,
+                "clickCount": 1,
+            },
+        )
+
+    def cdp_type_text(self, text: str) -> None:
+        """Types text character-by-character via CDP without touching OS keyboard focus."""
+        for ch in text:
+            self.send_cdp("Input.insertText", {"text": ch})
+            time.sleep(random.uniform(0.025, 0.055))
+
+    def scroll_into_view_and_get_coords(
         self, js_element_getter: str
-    ) -> Optional[Tuple[int, int, str]]:
+    ) -> Optional[Dict[str, Any]]:
         """Scrolls the DOM element returned by `js_element_getter` into view, waits briefly
-        for scroll/layout to settle, and computes its absolute OS screen (x, y) coordinates.
+        for layout to settle, and returns both its viewport (vx, vy) and OS screen (x, y) coords.
         """
         scroll_script = f"""
         (() => {{
@@ -92,7 +145,6 @@ class ChromeCDPBridge:
         if not found:
             return None
 
-        # Allow browser layout/scroll position to settle before reading coordinates
         time.sleep(0.15)
 
         coords_script = f"""
@@ -102,14 +154,19 @@ class ChromeCDPBridge:
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return null;
 
+            const vx = rect.left + rect.width / 2;
+            const vy = rect.top + rect.height / 2;
+
             const dpr = window.devicePixelRatio || 1;
             const chromeTopBorder = window.outerHeight - (window.innerHeight * dpr);
             const chromeLeftBorder = (window.outerWidth - (window.innerWidth * dpr)) / 2;
 
-            const screenX = window.screenX + chromeLeftBorder + (rect.left + rect.width / 2) * dpr;
-            const screenY = window.screenY + chromeTopBorder + (rect.top + rect.height / 2) * dpr;
+            const screenX = window.screenX + chromeLeftBorder + vx * dpr;
+            const screenY = window.screenY + chromeTopBorder + vy * dpr;
 
             return {{
+                vx: vx,
+                vy: vy,
                 x: Math.round(screenX),
                 y: Math.round(screenY),
                 text: (el.innerText || el.value || '').replace(/\\s+/g, ' ').trim()
@@ -119,16 +176,16 @@ class ChromeCDPBridge:
         res = self.evaluate(coords_script)
         if not res:
             return None
-        return int(res["x"]), int(res["y"]), str(res.get("text", ""))
+        return res
 
-    def wait_for_screen_coords(
+    def wait_for_coords(
         self,
         js_element_getter: str,
         timeout: float = config.ELEMENT_WAIT_TIMEOUT,
         poll_interval: float = 0.4,
-    ) -> Optional[Tuple[int, int, str]]:
+    ) -> Optional[Dict[str, Any]]:
         """Polls the DOM up to `timeout` seconds until `js_element_getter` returns a visible
-        element, then scrolls it into view and returns its OS screen (x, y, text).
+        element, then scrolls it into view and returns its coordinate dictionary.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -136,24 +193,26 @@ class ChromeCDPBridge:
                 if is_security_check_page(self):
                     wait_for_security_check_resolution(self)
                     deadline = time.time() + timeout
-                coords = self.scroll_into_view_and_get_screen_coords(js_element_getter)
+                coords = self.scroll_into_view_and_get_coords(js_element_getter)
                 if coords is not None:
                     return coords
             except Exception:
-                # Page may be mid-navigation; keep polling
                 pass
             time.sleep(poll_interval)
         return None
 
 
-def click_screen_coords(x: int, y: int, label: str = "") -> None:
-    """Moves mouse smoothly to (x, y) on the target monitor and clicks via PyAutoGUI."""
-    jitter_x = random.randint(-config.CLICK_JITTER_PX, config.CLICK_JITTER_PX)
-    jitter_y = random.randint(-config.CLICK_JITTER_PX, config.CLICK_JITTER_PX)
-    target_x, target_y = x + jitter_x, y + jitter_y
-    print(f"[PyAutoGUI] Clicking {label} at ({target_x}, {target_y})")
-    pyautogui.moveTo(target_x, target_y, duration=config.MOUSE_MOVE_DURATION)
-    pyautogui.click()
+def click_target(bridge: ChromeCDPBridge, coords: Dict[str, Any], label: str = "") -> None:
+    """Clicks the target element using either cursor-free CDP input (default) or PyAutoGUI."""
+    if getattr(config, "USE_PHYSICAL_MOUSE", False):
+        jitter_x = random.randint(-config.CLICK_JITTER_PX, config.CLICK_JITTER_PX)
+        jitter_y = random.randint(-config.CLICK_JITTER_PX, config.CLICK_JITTER_PX)
+        target_x, target_y = int(coords["x"]) + jitter_x, int(coords["y"]) + jitter_y
+        print(f"[PyAutoGUI] Clicking {label} at ({target_x}, {target_y})")
+        pyautogui.moveTo(target_x, target_y, duration=config.MOUSE_MOVE_DURATION)
+        pyautogui.click()
+    else:
+        bridge.cdp_click_viewport(float(coords["vx"]), float(coords["vy"]), label=label)
 
 
 def notify_audible(urgent: bool = False) -> None:
@@ -180,13 +239,11 @@ def is_security_check_page(bridge: ChromeCDPBridge) -> bool:
     """Detects if the Imperva / hCaptcha 'Additional security check is required' page is active."""
     script = """
     (() => {
-        // 1. Check for Imperva / Incapsula or hCaptcha iframes
         const secIframe = document.querySelector(
             '#main-iframe, iframe[src*="_Incapsula_Resource"], iframe[src*="hcaptcha"], iframe[src*="imperva"]'
         );
         if (secIframe) return true;
 
-        // 2. Check top-level body text if rendered directly
         const txt = (document.body?.innerText || '').toLowerCase();
         if (
             txt.includes('additional security check is required') ||
@@ -220,13 +277,11 @@ def wait_for_security_check_resolution(bridge: ChromeCDPBridge) -> None:
     last_beep = time.time()
     while True:
         time.sleep(1.5)
-        # Re-beep gently every 20 seconds if still waiting
         if time.time() - last_beep > 20.0:
             notify_captcha_alert()
             last_beep = time.time()
 
         if not is_security_check_page(bridge):
-            # Verify normal DVSA page content has loaded back
             normal_page = bridge.evaluate(
                 "Boolean(document.querySelector('#test-centres-input, #test-centres-submit, a.test-centre-details-link, .BookingCalendar-datesBody, #slot-chosen-submit'))"
             )
@@ -245,25 +300,39 @@ DATE_REGEX = re.compile(
 
 
 def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) -> bool:
-    """Types a postcode/search query (if provided) into the search input box and clicks 'Find test centres'."""
+    """Types a postcode/search query into the search input box and clicks 'Find test centres'."""
     wait_for_security_check_resolution(bridge)
     if query is not None:
         input_getter = """
         document.querySelector('#test-centres-input, input[name="testCentreName"], input[type="text"]')
         """
-        coords = bridge.scroll_into_view_and_get_screen_coords(input_getter)
+        coords = bridge.scroll_into_view_and_get_coords(input_getter)
         if not coords:
             if is_security_check_page(bridge):
                 wait_for_security_check_resolution(bridge)
-                coords = bridge.scroll_into_view_and_get_screen_coords(input_getter)
+                coords = bridge.scroll_into_view_and_get_coords(input_getter)
             if not coords:
                 print("[WARN] Could not find the postcode search input box.")
                 return False
-        click_screen_coords(coords[0], coords[1], label=f"Search Input ('{query}')")
-        pyautogui.hotkey("ctrl", "a")
-        time.sleep(0.05)
-        pyautogui.press("backspace")
-        pyautogui.write(query, interval=0.04)
+
+        click_target(bridge, coords, label=f"Search Input ('{query}')")
+        if getattr(config, "USE_PHYSICAL_MOUSE", False):
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.05)
+            pyautogui.press("backspace")
+            pyautogui.write(query, interval=0.04)
+        else:
+            # Clear input and focus via DOM, then insert characters via CDP Input.insertText
+            bridge.evaluate(
+                """
+                (() => {
+                    const el = document.querySelector('#test-centres-input, input[name="testCentreName"], input[type="text"]');
+                    if (el) { el.focus(); el.value = ''; }
+                })()
+                """
+            )
+            time.sleep(0.05)
+            bridge.cdp_type_text(query)
         time.sleep(0.15)
 
     submit_getter = """
@@ -274,15 +343,16 @@ def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) ->
         return allBtns.find(b => (b.value || b.innerText || '').toLowerCase().includes('find test centres')) || null;
     })()
     """
-    btn_coords = bridge.scroll_into_view_and_get_screen_coords(submit_getter)
+    btn_coords = bridge.scroll_into_view_and_get_coords(submit_getter)
     if not btn_coords:
         if is_security_check_page(bridge):
             wait_for_security_check_resolution(bridge)
-            btn_coords = bridge.scroll_into_view_and_get_screen_coords(submit_getter)
+            btn_coords = bridge.scroll_into_view_and_get_coords(submit_getter)
         if not btn_coords:
             print("[WARN] Could not find 'Find test centres' button.")
             return False
-    click_screen_coords(btn_coords[0], btn_coords[1], label="Find test centres")
+
+    click_target(bridge, btn_coords, label="Find test centres")
     time.sleep(config.PAGE_TRANSITION_DELAY)
     wait_for_security_check_resolution(bridge)
     return True
@@ -321,7 +391,7 @@ def scan_locations(bridge: ChromeCDPBridge) -> List[Dict[str, Any]]:
 
 
 def click_location(bridge: ChromeCDPBridge, location_name: str) -> bool:
-    """Finds the green header bar link for `location_name` and clicks it via PyAutoGUI."""
+    """Finds the green header bar link for `location_name` and clicks it."""
     loc_escaped = json.dumps(location_name)
     getter = f"""
     (() => {{
@@ -339,33 +409,30 @@ def click_location(bridge: ChromeCDPBridge, location_name: str) -> bool:
         return match.querySelector('.test-centre-details, span.underline, h4') || match;
     }})()
     """
-    coords = bridge.scroll_into_view_and_get_screen_coords(getter)
+    coords = bridge.scroll_into_view_and_get_coords(getter)
     if not coords:
-        print(f"[WARN] Could not determine screen coordinates for location: {location_name}")
+        print(f"[WARN] Could not determine coordinates for location: {location_name}")
         return False
-    click_screen_coords(coords[0], coords[1], label=f"Test Centre '{location_name}'")
+    click_target(bridge, coords, label=f"Test Centre '{location_name}'")
 
-    # If Chrome was unfocused on the second monitor, the first click may only focus the window.
-    # Wait briefly and click again if we are still on the search results page and not navigating.
     time.sleep(1.0)
     still_on_results = bridge.evaluate(
         "Boolean(document.querySelector('a.test-centre-details-link') && !document.querySelector('.BookingCalendar-datesBody, a.BookingCalendar-dateLink'))"
     )
     if still_on_results:
-        coords_retry = bridge.scroll_into_view_and_get_screen_coords(getter)
+        coords_retry = bridge.scroll_into_view_and_get_coords(getter)
         if coords_retry:
-            click_screen_coords(coords_retry[0], coords_retry[1], label=f"Test Centre '{location_name}' (confirm click)")
+            click_target(bridge, coords_retry, label=f"Test Centre '{location_name}' (confirm click)")
 
     return True
 
 
 def select_earliest_calendar_date(bridge: ChromeCDPBridge) -> bool:
     """Finds all visible bookable white calendar date cells (e.g. '27', '5') on the
-    Step 5 ('Test time') calendar, picks the earliest one, and clicks it via PyAutoGUI.
+    Step 5 ('Test time') calendar, picks the earliest one, and clicks it.
     """
     getter = """
     (() => {
-        // Select only bookable date links that are currently visible on the active calendar grid
         let dateLinks = Array.from(document.querySelectorAll(
             'td.BookingCalendar-date--bookable a.BookingCalendar-dateLink, a.BookingCalendar-dateLink, td.bookable a'
         )).filter(el => {
@@ -382,7 +449,6 @@ def select_earliest_calendar_date(bridge: ChromeCDPBridge) -> bool:
 
         if (dateLinks.length === 0) return null;
 
-        // Sort chronologically by data-date="YYYY-MM-DD" if present, otherwise keep DOM order
         dateLinks.sort((a, b) => {
             const da = a.getAttribute('data-date') || a.dataset?.date || '';
             const db = b.getAttribute('data-date') || b.dataset?.date || '';
@@ -393,21 +459,20 @@ def select_earliest_calendar_date(bridge: ChromeCDPBridge) -> bool:
         return dateLinks[0];
     })()
     """
-    coords = bridge.wait_for_screen_coords(getter, timeout=config.ELEMENT_WAIT_TIMEOUT)
+    coords = bridge.wait_for_coords(getter, timeout=config.ELEMENT_WAIT_TIMEOUT)
     if not coords:
         print("[WARN] Could not find any bookable calendar dates on the page (timed out).")
         return False
-    click_screen_coords(coords[0], coords[1], label=f"Earliest Calendar Date ('{coords[2]}')")
+    click_target(bridge, coords, label=f"Earliest Calendar Date ('{coords['text']}')")
     return True
 
 
 def select_latest_time_slot(bridge: ChromeCDPBridge) -> bool:
     """Scrolls down to the 'Choose a time' panel for the selected date, finds all visible
-    time slot cards (e.g. '9:17am £75'), and clicks the latest time via PyAutoGUI.
+    time slot cards (e.g. '9:17am £75'), and clicks the latest time.
     """
     getter = """
     (() => {
-        // Match time strings like "9:17am", "2:22pm", "14:30" inside the active day's slot picker
         const timeRegex = /\\b([01]?\\d|2[0-3])[:.]([0-5]\\d)(\\s*[ap]m)?\\b/i;
 
         const candidates = Array.from(document.querySelectorAll(
@@ -439,11 +504,11 @@ def select_latest_time_slot(bridge: ChromeCDPBridge) -> bool:
         return candidates[candidates.length - 1];
     })()
     """
-    coords = bridge.wait_for_screen_coords(getter, timeout=config.ELEMENT_WAIT_TIMEOUT)
+    coords = bridge.wait_for_coords(getter, timeout=config.ELEMENT_WAIT_TIMEOUT)
     if not coords:
         print("[WARN] Could not find any visible time slot options (timed out).")
         return False
-    click_screen_coords(coords[0], coords[1], label=f"Latest Time Slot ('{coords[2]}')")
+    click_target(bridge, coords, label=f"Latest Time Slot ('{coords['text']}')")
     return True
 
 
@@ -478,11 +543,11 @@ def click_continue_button(
         return null;
     }})()
     """
-    coords = bridge.wait_for_screen_coords(getter, timeout=timeout)
+    coords = bridge.wait_for_coords(getter, timeout=timeout)
     if not coords:
         print(f"[WARN] Could not find '{step_name}' button.")
         return False
-    click_screen_coords(coords[0], coords[1], label=f"{step_name} ('{coords[2]}')")
+    click_target(bridge, coords, label=f"{step_name} ('{coords['text']}')")
     return True
 
 
@@ -511,7 +576,6 @@ def handle_calendar_and_slot_flow(bridge: ChromeCDPBridge) -> bool:
     if not click_continue_button(bridge, step_name="Continue (1)", prefer_warning_modal=False):
         return False
 
-    # Wait briefly for either the warning modal or next page Continue button to appear
     time.sleep(0.8)
     print("[Step 3.4] Waiting for second 'Continue' button...")
     click_continue_button(bridge, step_name="Continue (2)", prefer_warning_modal=True, timeout=4.0)
@@ -562,7 +626,7 @@ def check_current_results(bridge: ChromeCDPBridge) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Hybrid Chrome + PyAutoGUI Booking Bot")
+    parser = argparse.ArgumentParser(description="Hybrid Chrome CDP Booking Bot")
     parser.add_argument(
         "--test-calendar",
         action="store_true",
@@ -573,13 +637,15 @@ def main() -> None:
     bridge = ChromeCDPBridge()
     bridge.connect()
 
+    mode_str = "Physical Mouse (PyAutoGUI)" if getattr(config, "USE_PHYSICAL_MOUSE", False) else "100% Cursor-Free (CDP Native Input)"
+    print(f"[Mode] {mode_str}")
+
     if args.test_calendar:
         print("[TEST MODE] Running calendar + time slot + continue flow on current page...")
         handle_calendar_and_slot_flow(bridge)
         return
 
     print("Monitoring locations for availability...")
-    # Check whatever results are already displayed on the page first
     if check_current_results(bridge):
         return
 

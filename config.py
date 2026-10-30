@@ -38,5 +38,10 @@ PAGE_TRANSITION_DELAY = 1.5
 ELEMENT_WAIT_TIMEOUT = 15.0  # Max seconds to wait for calendar / slots / buttons to load
 CLICK_JITTER_PX = 3
 
-# PyAutoGUI settings
+# Input mode:
+# False = 100% Cursor-Free mode via Chrome DevTools Protocol (never touches your OS mouse/focus)
+# True  = Physical OS mouse movement & clicks via PyAutoGUI
+USE_PHYSICAL_MOUSE = False
+
+# PyAutoGUI settings (only used when USE_PHYSICAL_MOUSE = True)
 MOUSE_MOVE_DURATION = 0.25  # Smooth human-like movement duration
