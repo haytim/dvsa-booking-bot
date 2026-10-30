@@ -33,3 +33,4 @@ A hybrid automation bot that monitors test centres on a secondary monitor using 
    ```
 
 > **Fail-safe**: Move your mouse cursor rapidly to any corner of your primary monitor to abort `pyautogui` at any time.
+
