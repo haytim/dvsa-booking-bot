@@ -133,6 +133,9 @@ class ChromeCDPBridge:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
+                if is_security_check_page(self):
+                    wait_for_security_check_resolution(self)
+                    deadline = time.time() + timeout
                 coords = self.scroll_into_view_and_get_screen_coords(js_element_getter)
                 if coords is not None:
                     return coords
@@ -165,6 +168,75 @@ def notify_audible(urgent: bool = False) -> None:
         winsound.Beep(1046, 400)
 
 
+def notify_captcha_alert() -> None:
+    """Plays a distinct two-tone alert sound when a security check / captcha appears."""
+    for _ in range(3):
+        winsound.Beep(950, 300)
+        winsound.Beep(650, 300)
+        time.sleep(0.1)
+
+
+def is_security_check_page(bridge: ChromeCDPBridge) -> bool:
+    """Detects if the Imperva / hCaptcha 'Additional security check is required' page is active."""
+    script = """
+    (() => {
+        // 1. Check for Imperva / Incapsula or hCaptcha iframes
+        const secIframe = document.querySelector(
+            '#main-iframe, iframe[src*="_Incapsula_Resource"], iframe[src*="hcaptcha"], iframe[src*="imperva"]'
+        );
+        if (secIframe) return true;
+
+        // 2. Check top-level body text if rendered directly
+        const txt = (document.body?.innerText || '').toLowerCase();
+        if (
+            txt.includes('additional security check is required') ||
+            txt.includes('complete the security check') ||
+            txt.includes('powered by imperva')
+        ) {
+            return true;
+        }
+        return false;
+    })()
+    """
+    try:
+        return bool(bridge.evaluate(script))
+    except Exception:
+        return False
+
+
+def wait_for_security_check_resolution(bridge: ChromeCDPBridge) -> None:
+    """Stops all bot activity, alerts the user audibly, and waits until the user completes
+    the security check and a normal booking page is back in Chrome.
+    """
+    if not is_security_check_page(bridge):
+        return
+
+    print("\n" + "=" * 70)
+    print("[SECURITY CHECK DETECTED] Bot paused! Please complete the captcha in Chrome.")
+    print("The bot will automatically resume once the booking page reloads.")
+    print("=" * 70 + "\n")
+    notify_captcha_alert()
+
+    last_beep = time.time()
+    while True:
+        time.sleep(1.5)
+        # Re-beep gently every 20 seconds if still waiting
+        if time.time() - last_beep > 20.0:
+            notify_captcha_alert()
+            last_beep = time.time()
+
+        if not is_security_check_page(bridge):
+            # Verify normal DVSA page content has loaded back
+            normal_page = bridge.evaluate(
+                "Boolean(document.querySelector('#test-centres-input, #test-centres-submit, a.test-centre-details-link, .BookingCalendar-datesBody, #slot-chosen-submit'))"
+            )
+            if normal_page:
+                print("[RESUMED] Security check completed! Resuming bot in 2 seconds...")
+                winsound.Beep(1046, 200)
+                time.sleep(2.0)
+                return
+
+
 # Matches e.g. "Dundee – available tests around 03/03/2027" (even if the dash is mangled as \ufffd)
 DATE_REGEX = re.compile(
     r"avai?li?able\s+tests\s+around\s+(\d{2})/(\d{2})/(\d{4})",
@@ -174,14 +246,19 @@ DATE_REGEX = re.compile(
 
 def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) -> bool:
     """Types a postcode/search query (if provided) into the search input box and clicks 'Find test centres'."""
+    wait_for_security_check_resolution(bridge)
     if query is not None:
         input_getter = """
         document.querySelector('#test-centres-input, input[name="testCentreName"], input[type="text"]')
         """
         coords = bridge.scroll_into_view_and_get_screen_coords(input_getter)
         if not coords:
-            print("[WARN] Could not find the postcode search input box.")
-            return False
+            if is_security_check_page(bridge):
+                wait_for_security_check_resolution(bridge)
+                coords = bridge.scroll_into_view_and_get_screen_coords(input_getter)
+            if not coords:
+                print("[WARN] Could not find the postcode search input box.")
+                return False
         click_screen_coords(coords[0], coords[1], label=f"Search Input ('{query}')")
         pyautogui.hotkey("ctrl", "a")
         time.sleep(0.05)
@@ -199,10 +276,15 @@ def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) ->
     """
     btn_coords = bridge.scroll_into_view_and_get_screen_coords(submit_getter)
     if not btn_coords:
-        print("[WARN] Could not find 'Find test centres' button.")
-        return False
+        if is_security_check_page(bridge):
+            wait_for_security_check_resolution(bridge)
+            btn_coords = bridge.scroll_into_view_and_get_screen_coords(submit_getter)
+        if not btn_coords:
+            print("[WARN] Could not find 'Find test centres' button.")
+            return False
     click_screen_coords(btn_coords[0], btn_coords[1], label="Find test centres")
     time.sleep(config.PAGE_TRANSITION_DELAY)
+    wait_for_security_check_resolution(bridge)
     return True
 
 
@@ -450,6 +532,7 @@ def evaluate_date_action(location: str, day: int, month: int, year: int) -> str:
 
 def check_current_results(bridge: ChromeCDPBridge) -> bool:
     """Scans the currently displayed search results and returns True if a booking flow completed."""
+    wait_for_security_check_resolution(bridge)
     matches = scan_locations(bridge)
     for item in matches:
         loc = item["location"]
