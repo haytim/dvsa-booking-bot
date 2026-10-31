@@ -7,4 +7,6 @@ env/
 .env
 .vscode/
 .idea/
+candidate_details.py
+search_limit_log.jsonl
 

@@ -14,7 +14,9 @@ SEARCH_QUERIES = [
 # Target locations to scan under "Your search results"
 TARGET_LOCATIONS = [
     "Dundee",
+    "Arbroath",
     "Edinburgh (Musselburgh)",
+    "Edinburgh (Currie)",
     "Livingston",
 ]
 
@@ -33,12 +35,17 @@ NOTIFY_ONLY_MONTHS = [
 ]
 
 # Rate limit & polling settings:
-# DVSA enforces an hourly limit of ~40 searches (50 total state transitions) per hour.
-# Setting MAX_SEARCHES_PER_HOUR = 36 (~1 search every 100s) spreads attempts evenly
-# across the hour while keeping a reserve quota to complete the booking when a slot drops.
-MAX_SEARCHES_PER_HOUR = 36
-POLL_JITTER_SECONDS = 8.0  # Random +/- seconds added to each wait interval
-SEARCH_LIMIT_COOLDOWN_SECONDS = 900  # 15-minute cooldown if "Search limit reached" modal appears
+# Pushing to 49 searches/hour (~1 search every 73s) to empirically test DVSA's rolling limit.
+# When the "Search limit reached" modal appears, the bot logs the exact number of searches
+# and execution state transitions (e1sXX) that triggered it, then probes recovery.
+MAX_SEARCHES_PER_HOUR = 49
+POLL_JITTER_SECONDS = 5.0  # Random +/- seconds added to each wait interval
+SEARCH_LIMIT_COOLDOWN_SECONDS = 300  # 5-minute cooldown probe when "Search limit reached" appears
+# Cumulative retry milestones (in minutes) when Imperva "Access Denied / Error 15" temporary block occurs:
+# Waits until 15m elapsed -> retries -> waits until 30m elapsed -> retries -> waits until 60m elapsed -> retries
+ERROR_15_RETRY_MINUTES = [15, 30, 60]
+SEARCH_LIMIT_LOG_FILE = "search_limit_log.jsonl"  # Persistent log of rate-limit & failure events
+AUTO_ADAPT_PACE_ON_LIMIT = False  # Set True to automatically lower MAX_SEARCHES_PER_HOUR after hitting the cap
 
 PAGE_TRANSITION_DELAY = 1.5
 ELEMENT_WAIT_TIMEOUT = 15.0  # Max seconds to wait for calendar / slots / buttons to load

@@ -1,8 +1,12 @@
 import argparse
 import collections
+from datetime import datetime
 import json
+import os
 import random
 import re
+import subprocess
+import sys
 import time
 import winsound
 from typing import Any, Deque, Dict, List, Optional
@@ -13,11 +17,58 @@ import websocket
 
 import config
 
+try:
+    from candidate_details import CANDIDATE_DETAILS
+except ImportError:
+    CANDIDATE_DETAILS = {}
+
 # Enable PyAutoGUI fail-safe (if USE_PHYSICAL_MOUSE is enabled)
 pyautogui.FAILSAFE = True
 
 # Rolling 60-minute window of search timestamps
 SEARCH_TIMESTAMPS: Deque[float] = collections.deque()
+
+# Empirical Search-Limit Telemetry & Calibration State
+SESSION_START_TIME: float = time.time()
+START_EXECUTION_STEP: Optional[int] = None
+LAST_LIMIT_EXECUTION_STEP: Optional[int] = None
+LAST_LIMIT_HIT_TIME: Optional[float] = None
+TOTAL_SUCCESSFUL_SEARCHES: int = 0
+SEARCHES_SINCE_LAST_LIMIT: int = 0
+DISCOVERED_MAX_SEARCHES: Optional[int] = None
+EFFECTIVE_MAX_SEARCHES_PER_HOUR: int = getattr(config, "MAX_SEARCHES_PER_HOUR", 72)
+
+EXECUTION_STEP_REGEX = re.compile(r"execution=e\d+s(\d+)", re.IGNORECASE)
+
+
+def ensure_chrome_running(host: str = config.CDP_HOST) -> None:
+    """Checks if Chrome remote debugging is reachable on `host`; if not, launches `start_chrome.bat`."""
+    url = f"{host.rstrip('/')}/json"
+    try:
+        resp = requests.get(url, timeout=2)
+        if resp.ok:
+            return
+    except requests.RequestException:
+        pass
+
+    bat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "start_chrome.bat")
+    if os.path.isfile(bat_path):
+        print(f"[Startup] Chrome not detected on {host}. Running start_chrome.bat...")
+        subprocess.Popen(["cmd.exe", "/c", bat_path], cwd=os.path.dirname(bat_path))
+    else:
+        chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        profile_dir = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\BotProfile")
+        print(f"[Startup] Launching Chrome with --remote-debugging-port=9222...")
+        subprocess.Popen([chrome_exe, "--remote-debugging-port=9222", f"--user-data-dir={profile_dir}"])
+
+    for _ in range(20):
+        time.sleep(1.0)
+        try:
+            resp = requests.get(url, timeout=2)
+            if resp.ok:
+                return
+        except requests.RequestException:
+            pass
 
 
 class ChromeCDPBridge:
@@ -29,48 +80,99 @@ class ChromeCDPBridge:
         self.host = host.rstrip("/")
         self.ws: Optional[websocket.WebSocket] = None
         self._msg_id = 0
+        self._url_keyword: Optional[str] = None
+        self._target_id: Optional[str] = None
 
-    def connect(self, url_keyword: Optional[str] = None) -> None:
-        resp = requests.get(f"{self.host}/json", timeout=5)
-        resp.raise_for_status()
-        targets = resp.json()
+    def is_tab_open(self) -> bool:
+        """Returns True if Chrome is still running and has at least one page tab open."""
+        try:
+            resp = requests.get(f"{self.host}/json", timeout=3)
+            if not resp.ok:
+                return False
+            targets = resp.json()
+            pages = [
+                t for t in targets
+                if t.get("type") == "page" and not t.get("url", "").startswith("devtools://")
+            ]
+            if not pages:
+                return False
+            if self._target_id:
+                return any(t.get("id") == self._target_id for t in pages)
+            return True
+        except requests.RequestException:
+            return False
+
+    def connect(self, url_keyword: Optional[str] = None, auto_launch: bool = False) -> None:
+        if url_keyword is not None:
+            self._url_keyword = url_keyword
+
+        if auto_launch:
+            ensure_chrome_running(self.host)
+
+        try:
+            resp = requests.get(f"{self.host}/json", timeout=5)
+            resp.raise_for_status()
+            targets = resp.json()
+        except requests.RequestException:
+            print("\n[INFO] Chrome debug window was closed. Stopping bot cleanly.")
+            sys.exit(0)
 
         page_target = None
-        for t in targets:
+        for t in targets or []:
             if t.get("type") != "page":
                 continue
-            if url_keyword and url_keyword.lower() not in t.get("url", "").lower():
+            if self._url_keyword and self._url_keyword.lower() not in t.get("url", "").lower():
                 continue
             if not t.get("url", "").startswith("devtools://"):
                 page_target = t
                 break
 
         if not page_target:
-            raise RuntimeError(
-                "No matching Chrome page tab found. Make sure Chrome was started with "
-                "--remote-debugging-port=9222 (see start_chrome.bat)."
-            )
+            print("\n[INFO] No open Chrome page tab found (tab was closed). Stopping bot cleanly.")
+            sys.exit(0)
 
+        self._target_id = page_target.get("id")
         ws_url = page_target["webSocketDebuggerUrl"]
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
         self.ws = websocket.create_connection(ws_url, timeout=10)
         print(f"[CDP] Connected to tab: {page_target.get('title')} ({page_target.get('url')})")
 
     def send_cdp(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Sends a raw CDP command and returns the result payload."""
-        if not self.ws:
-            raise RuntimeError("WebSocket is not connected.")
-        self._msg_id += 1
-        payload = {
-            "id": self._msg_id,
-            "method": method,
-            "params": params or {},
-        }
-        self.ws.send(json.dumps(payload))
-        while True:
-            raw = self.ws.recv()
-            msg = json.loads(raw)
-            if msg.get("id") == self._msg_id:
-                return msg.get("result", {})
+        """Sends a raw CDP command and returns the result payload. Exits cleanly if Chrome tab was closed."""
+        for attempt in range(3):
+            if not self.ws:
+                if not self.is_tab_open():
+                    print("\n[INFO] Chrome tab/window was closed by user. Exiting bot cleanly.")
+                    sys.exit(0)
+                self.connect()
+            self._msg_id += 1
+            payload = {
+                "id": self._msg_id,
+                "method": method,
+                "params": params or {},
+            }
+            try:
+                assert self.ws is not None
+                self.ws.send(json.dumps(payload))
+                while True:
+                    raw = self.ws.recv()
+                    msg = json.loads(raw)
+                    if msg.get("id") == self._msg_id:
+                        return msg.get("result", {})
+            except (websocket.WebSocketException, OSError, ConnectionError) as exc:
+                self.ws = None
+                if not self.is_tab_open():
+                    print("\n[INFO] Chrome tab/window was closed by user. Exiting bot cleanly.")
+                    sys.exit(0)
+                print(f"[CDP] WebSocket reset ({exc}), reconnecting to tab (attempt {attempt + 1}/3)...")
+                time.sleep(1.0)
+                if attempt == 2:
+                    raise
+        return {}
 
     def evaluate(self, js_expression: str) -> Any:
         res = self.send_cdp(
@@ -239,8 +341,43 @@ def notify_captcha_alert() -> None:
         time.sleep(0.1)
 
 
+def is_error_15_block_page(bridge: ChromeCDPBridge) -> bool:
+    """Detects Imperva 'Access Denied / Error 15 (You have been blocked by DVSA security rules)'
+    temporary rate-limit page (which requires waiting ~15-30-60 minutes rather than solving a captcha).
+    """
+    script = """
+    (() => {
+        let combinedText = (document.body?.innerText || '').toLowerCase();
+        const iframes = Array.from(document.querySelectorAll(
+            '#main-iframe, iframe[src*="_Incapsula_Resource"], iframe'
+        ));
+        for (const frame of iframes) {
+            try {
+                const frameTxt = (frame.contentDocument?.body?.innerText || '').toLowerCase();
+                if (frameTxt) combinedText += '\\n' + frameTxt;
+            } catch (e) {}
+        }
+        return (
+            combinedText.includes('error 15') ||
+            combinedText.includes('blocked by dvsa security rules') ||
+            combinedText.includes('request was blocked by our security service') ||
+            (combinedText.includes('access denied') && combinedText.includes('imperva'))
+        );
+    })()
+    """
+    try:
+        return bool(bridge.evaluate(script))
+    except Exception:
+        return False
+
+
 def is_security_check_page(bridge: ChromeCDPBridge) -> bool:
-    """Detects if the Imperva / hCaptcha 'Additional security check is required' page is active."""
+    """Detects if an interactive Imperva / hCaptcha 'Additional security check is required' page is active
+    (excluding Error 15 temporary blocks).
+    """
+    if is_error_15_block_page(bridge):
+        return False
+
     script = """
     (() => {
         const secIframe = document.querySelector(
@@ -265,30 +402,204 @@ def is_security_check_page(bridge: ChromeCDPBridge) -> bool:
         return False
 
 
-def wait_for_security_check_resolution(bridge: ChromeCDPBridge) -> None:
-    """Stops all bot activity, alerts the user audibly, and waits until the user completes
-    the security check and a normal booking page is back in Chrome.
+def get_execution_step(bridge: ChromeCDPBridge) -> Optional[int]:
+    """Extracts the numeric Spring Web Flow step from `execution=e1s<N>` in the current URL."""
+    try:
+        url = bridge.evaluate("window.location.href") or ""
+        m = EXECUTION_STEP_REGEX.search(str(url))
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def prune_search_timestamps(now: Optional[float] = None) -> None:
+    """Removes search timestamps older than 60 minutes (3600 seconds)."""
+    if now is None:
+        now = time.time()
+    while SEARCH_TIMESTAMPS and (now - SEARCH_TIMESTAMPS[0]) > 3600.0:
+        SEARCH_TIMESTAMPS.popleft()
+
+
+def log_telemetry_event(event_type: str, data: Dict[str, Any]) -> None:
+    """Appends a structured JSON line to `config.SEARCH_LIMIT_LOG_FILE`."""
+    log_path = getattr(config, "SEARCH_LIMIT_LOG_FILE", "search_limit_log.jsonl")
+    if not log_path:
+        return
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "event": event_type,
+        **data,
+    }
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as exc:
+        print(f"[WARN] Could not write telemetry log: {exc}")
+
+
+def wait_for_error_15_resolution(bridge: ChromeCDPBridge) -> None:
+    """Handles Imperva 'Access Denied / Error 15' temporary blocks by waiting through cumulative
+    milestones (15m -> 30m -> 60m from config.ERROR_15_RETRY_MINUTES), automatically reloading
+    the page at each milestone until the temporary block clears.
     """
+    global DISCOVERED_MAX_SEARCHES, EFFECTIVE_MAX_SEARCHES_PER_HOUR, SEARCHES_SINCE_LAST_LIMIT
+
+    if not is_error_15_block_page(bridge):
+        return
+
+    block_start = time.time()
+    prune_search_timestamps(block_start)
+    rolling_count = len(SEARCH_TIMESTAMPS)
+    cur_step = get_execution_step(bridge)
+
+    if rolling_count > 0:
+        DISCOVERED_MAX_SEARCHES = rolling_count
+        if getattr(config, "AUTO_ADAPT_PACE_ON_LIMIT", False):
+            EFFECTIVE_MAX_SEARCHES_PER_HOUR = max(1, rolling_count - 4)
+
+    milestones_mins: List[int] = list(getattr(config, "ERROR_15_RETRY_MINUTES", [15, 30, 60]))
+    if not milestones_mins:
+        milestones_mins = [15, 30, 60]
+
+    log_telemetry_event(
+        "error_15_temporary_block",
+        {
+            "rolling_60m_searches": rolling_count,
+            "searches_since_last_limit": SEARCHES_SINCE_LAST_LIMIT,
+            "total_session_searches": TOTAL_SUCCESSFUL_SEARCHES,
+            "execution_step": cur_step,
+            "retry_milestones_minutes": milestones_mins,
+        },
+    )
+    SEARCHES_SINCE_LAST_LIMIT = 0
+
+    print("\n" + "!" * 74)
+    print("[IMPERVA ERROR 15 — TEMPORARY COOLDOWN BLOCK DETECTED]")
+    print(
+        f"  -> Triggered at URL step: s{cur_step} | Rolling 60m searches: {rolling_count} "
+        f"(Session total: {TOTAL_SUCCESSFUL_SEARCHES})"
+    )
+    print(
+        f"  -> Auto-retry schedule: {', '.join(str(m) + 'm' for m in milestones_mins)} "
+        "(no action needed — bot will wait and reload automatically)."
+    )
+    print("!" * 74 + "\n")
+
+    attempt_idx = 0
+    while True:
+        if attempt_idx < len(milestones_mins):
+            target_elapsed_mins = milestones_mins[attempt_idx]
+        else:
+            target_elapsed_mins = milestones_mins[-1] + 15 * (attempt_idx - len(milestones_mins) + 1)
+
+        target_time = block_start + (target_elapsed_mins * 60.0)
+        last_status_print = time.time()
+
+        while time.time() < target_time:
+            time.sleep(5.0)
+            if not bridge.is_tab_open():
+                print("\n[INFO] Chrome tab/window was closed by user. Exiting bot cleanly.")
+                sys.exit(0)
+
+            # If user manually refreshed or navigated away and Error 15 is already cleared:
+            if not is_error_15_block_page(bridge):
+                elapsed_m = (time.time() - block_start) / 60.0
+                print(f"[Error 15 Cleared] Page is no longer showing Error 15 (after {elapsed_m:.1f}m)!")
+                log_telemetry_event("error_15_recovered", {"recovery_minutes": round(elapsed_m, 1)})
+                winsound.Beep(1046, 200)
+                time.sleep(1.5)
+                return
+
+            if time.time() - last_status_print >= 60.0:
+                elapsed_m = (time.time() - block_start) / 60.0
+                rem_m = max(0.0, (target_time - time.time()) / 60.0)
+                print(
+                    f"[Error 15 Cooldown] {elapsed_m:.0f}m elapsed | "
+                    f"Next auto-retry at {target_elapsed_mins}m mark (in {rem_m:.1f}m)..."
+                )
+                last_status_print = time.time()
+
+        # Milestone reached: reload page to test if temporary block has lifted
+        print(
+            f"[Error 15 Retry #{attempt_idx + 1}] {target_elapsed_mins} minutes elapsed — "
+            "reloading page to check if temporary block has lifted..."
+        )
+        try:
+            bridge.evaluate("window.location.reload()")
+        except Exception:
+            pass
+        time.sleep(4.0)
+
+        if not is_error_15_block_page(bridge):
+            elapsed_m = (time.time() - block_start) / 60.0
+            print(f"[Error 15 Recovered] Temporary block lifted after {elapsed_m:.1f} minutes!")
+            log_telemetry_event("error_15_recovered", {"recovery_minutes": round(elapsed_m, 1)})
+            winsound.Beep(1046, 200)
+            time.sleep(1.5)
+            return
+
+        attempt_idx += 1
+        next_target = (
+            milestones_mins[attempt_idx]
+            if attempt_idx < len(milestones_mins)
+            else milestones_mins[-1] + 15 * (attempt_idx - len(milestones_mins) + 1)
+        )
+        print(
+            f"[Error 15 Still Active] Still blocked at {target_elapsed_mins}m mark. "
+            f"Waiting until {next_target}m mark..."
+        )
+
+
+def wait_for_security_check_resolution(bridge: ChromeCDPBridge) -> None:
+    """Stops all bot activity, handles Error 15 cooldowns or interactive captchas, and waits
+    until a normal booking page is back in Chrome (or exits cleanly if tab closed).
+    """
+    if is_error_15_block_page(bridge):
+        wait_for_error_15_resolution(bridge)
+        wait_until_test_centre_page_ready(bridge)
+        return
+
     if not is_security_check_page(bridge):
         return
 
+    now = time.time()
+    prune_search_timestamps(now)
+    cur_step = get_execution_step(bridge)
+    log_telemetry_event(
+        "security_check_triggered",
+        {
+            "rolling_60m_searches": len(SEARCH_TIMESTAMPS),
+            "searches_since_last_limit": SEARCHES_SINCE_LAST_LIMIT,
+            "total_session_searches": TOTAL_SUCCESSFUL_SEARCHES,
+            "execution_step": cur_step,
+        },
+    )
+
     print("\n" + "=" * 70)
-    print("[SECURITY CHECK DETECTED] Bot paused! Please complete the captcha in Chrome.")
+    print(
+        f"[SECURITY CHECK DETECTED] Triggered at {len(SEARCH_TIMESTAMPS)} searches in rolling 60m "
+        f"(total: {TOTAL_SUCCESSFUL_SEARCHES}, URL step: e1s{cur_step})."
+    )
+    print("Bot paused! Please complete the captcha in Chrome (or close the tab to stop the bot).")
     print("The bot will automatically resume once the booking page reloads.")
     print("=" * 70 + "\n")
     notify_captcha_alert()
 
-    last_beep = time.time()
     while True:
         time.sleep(1.5)
-        if time.time() - last_beep > 20.0:
-            notify_captcha_alert()
-            last_beep = time.time()
+        if not bridge.is_tab_open():
+            print("\n[INFO] Chrome tab/window was closed by user. Exiting bot cleanly.")
+            sys.exit(0)
 
         if not is_security_check_page(bridge):
-            normal_page = bridge.evaluate(
-                "Boolean(document.querySelector('#test-centres-input, #test-centres-submit, a.test-centre-details-link, .BookingCalendar-datesBody, #slot-chosen-submit'))"
-            )
+            try:
+                normal_page = bridge.evaluate(
+                    "Boolean(document.querySelector('#test-centres-input, #test-centres-submit, a.test-centre-details-link, .BookingCalendar-datesBody, #slot-chosen-submit'))"
+                )
+            except Exception:
+                normal_page = False
             if normal_page:
                 print("[RESUMED] Security check completed! Resuming bot in 2 seconds...")
                 winsound.Beep(1046, 200)
@@ -321,15 +632,80 @@ def is_search_limit_reached(bridge: ChromeCDPBridge) -> bool:
 
 
 def handle_search_limit_if_present(bridge: ChromeCDPBridge) -> bool:
-    """If the 'Search limit reached' modal is open, clicks 'Ok' to dismiss it and sleeps
-    for `SEARCH_LIMIT_COOLDOWN_SECONDS` so the rolling hourly quota recovers.
+    """If the 'Search limit reached' modal is open, calculates the exact empirical search limit
+    that triggered it, logs it to console and JSONL, clicks 'Ok' to dismiss, and sleeps for
+    `SEARCH_LIMIT_COOLDOWN_SECONDS` so the rolling hourly quota recovers.
     Returns True if rate limit was hit and handled.
     """
+    global DISCOVERED_MAX_SEARCHES, EFFECTIVE_MAX_SEARCHES_PER_HOUR
+    global LAST_LIMIT_HIT_TIME, LAST_LIMIT_EXECUTION_STEP, SEARCHES_SINCE_LAST_LIMIT
+
     if not is_search_limit_reached(bridge):
         return False
 
-    print("\n" + "!" * 70)
+    now = time.time()
+    prune_search_timestamps(now)
+
+    # Number of searches in the rolling 60m window (excluding the blocked attempt if it was just appended)
+    rolling_count = len(SEARCH_TIMESTAMPS)
+    cur_step = get_execution_step(bridge)
+    step_from_start = (cur_step - START_EXECUTION_STEP) if (cur_step and START_EXECUTION_STEP) else None
+    step_since_last = (
+        (cur_step - LAST_LIMIT_EXECUTION_STEP) if (cur_step and LAST_LIMIT_EXECUTION_STEP) else step_from_start
+    )
+
+    if SEARCH_TIMESTAMPS:
+        window_span_sec = max(1.0, now - SEARCH_TIMESTAMPS[0])
+        effective_rate = (rolling_count / window_span_sec) * 3600.0
+    else:
+        window_span_sec = max(1.0, now - SESSION_START_TIME)
+        effective_rate = 0.0
+
+    # Record empirical max searches before failure
+    if rolling_count > 0:
+        DISCOVERED_MAX_SEARCHES = rolling_count
+    safe_recommended = max(1, (DISCOVERED_MAX_SEARCHES or 40) - 4)
+
+    if getattr(config, "AUTO_ADAPT_PACE_ON_LIMIT", False) and DISCOVERED_MAX_SEARCHES:
+        EFFECTIVE_MAX_SEARCHES_PER_HOUR = safe_recommended
+
+    telemetry_payload = {
+        "discovered_max_searches_in_60m": rolling_count,
+        "searches_since_last_limit": SEARCHES_SINCE_LAST_LIMIT,
+        "total_session_searches": TOTAL_SUCCESSFUL_SEARCHES,
+        "window_elapsed_minutes": round(window_span_sec / 60.0, 2),
+        "effective_pace_per_hour": round(effective_rate, 1),
+        "execution_step": cur_step,
+        "execution_step_delta_from_start": step_from_start,
+        "execution_step_delta_since_last_limit": step_since_last,
+        "recommended_safe_searches_per_hour": safe_recommended,
+    }
+    log_telemetry_event("search_limit_reached", telemetry_payload)
+
+    LAST_LIMIT_HIT_TIME = now
+    LAST_LIMIT_EXECUTION_STEP = cur_step
+    SEARCHES_SINCE_LAST_LIMIT = 0
+
+    print("\n" + "!" * 74)
     print("[HOURLY LIMIT REACHED] DVSA 'Search limit reached' dialog detected!")
+    print(
+        f"  -> Empirical Max Searches (last 60m) : {rolling_count} searches "
+        f"in {window_span_sec / 60.0:.1f} mins ({effective_rate:.1f}/hr pace)"
+    )
+    print(
+        f"  -> Searches Since Start / Last Limit : {telemetry_payload['searches_since_last_limit']} "
+        f"(Session Total: {TOTAL_SUCCESSFUL_SEARCHES})"
+    )
+    print(
+        f"  -> URL State Counter (execution)     : e1s{cur_step} "
+        f"(+{step_from_start} since start, +{step_since_last} since last limit)"
+    )
+    print(
+        f"  -> Recommended Safe Hourly Setting   : MAX_SEARCHES_PER_HOUR = {safe_recommended} "
+        f"(leaves 4-step booking reserve)"
+    )
+    print(f"  -> Logged details to                 : {getattr(config, 'SEARCH_LIMIT_LOG_FILE', 'search_limit_log.jsonl')}")
+
     ok_coords = bridge.scroll_into_view_and_get_coords(
         "document.querySelector('#warning-ok, a[href*=\"dnSearchLimitWarningAck\"]')"
     )
@@ -337,10 +713,10 @@ def handle_search_limit_if_present(bridge: ChromeCDPBridge) -> bool:
         click_target(bridge, ok_coords, label="Search Limit Modal 'Ok'")
         time.sleep(1.0)
 
-    cooldown = getattr(config, "SEARCH_LIMIT_COOLDOWN_SECONDS", 900)
+    cooldown = getattr(config, "SEARCH_LIMIT_COOLDOWN_SECONDS", 300)
     mins = cooldown / 60.0
-    print(f"[COOLDOWN] Pausing searches for {mins:.0f} minutes ({cooldown}s) to let hourly quota reset...")
-    print("!" * 70 + "\n")
+    print(f"[COOLDOWN] Pausing searches for {mins:.1f} minutes ({cooldown}s) before probing quota recovery...")
+    print("!" * 74 + "\n")
     smart_sleep_with_keepalive(bridge, cooldown)
     return True
 
@@ -355,7 +731,7 @@ def smart_sleep_with_keepalive(bridge: ChromeCDPBridge, duration: float) -> None
         remaining = end_time - time.time()
         time.sleep(min(5.0, max(0.1, remaining)))
         try:
-            if is_security_check_page(bridge):
+            if is_error_15_block_page(bridge) or is_security_check_page(bridge):
                 wait_for_security_check_resolution(bridge)
             # Check for DVSA session timeout warning modal and keep session alive
             keep_alive_getter = """
@@ -377,27 +753,31 @@ def smart_sleep_with_keepalive(bridge: ChromeCDPBridge, duration: float) -> None
 
 
 def compute_smart_poll_delay() -> float:
-    """Computes the delay before the next search to spread `MAX_SEARCHES_PER_HOUR` evenly
+    """Computes the delay before the next search to spread `EFFECTIVE_MAX_SEARCHES_PER_HOUR` evenly
     across 3600 seconds, accounting for the rolling 60-minute window.
     """
     now = time.time()
-    # Prune timestamps older than 3600 seconds (1 hour)
-    while SEARCH_TIMESTAMPS and (now - SEARCH_TIMESTAMPS[0]) > 3600.0:
-        SEARCH_TIMESTAMPS.popleft()
+    prune_search_timestamps(now)
 
-    max_per_hour = max(1, getattr(config, "MAX_SEARCHES_PER_HOUR", 36))
-    base_interval = 3600.0 / max_per_hour  # e.g. 3600 / 36 = 100.0s
-    jitter = getattr(config, "POLL_JITTER_SECONDS", 8.0)
+    max_per_hour = max(1, EFFECTIVE_MAX_SEARCHES_PER_HOUR)
+    base_interval = 3600.0 / max_per_hour  # e.g. 3600 / 72 = 50.0s
+    jitter = getattr(config, "POLL_JITTER_SECONDS", 5.0)
 
     # If rolling window is already full, wait until the oldest search expires from the 1-hour window
     if len(SEARCH_TIMESTAMPS) >= max_per_hour:
         oldest_expiry = (SEARCH_TIMESTAMPS[0] + 3605.0) - now
         delay = max(base_interval, oldest_expiry) + random.uniform(2.0, jitter)
     else:
-        delay = max(15.0, base_interval + random.uniform(-jitter, jitter))
+        delay = max(10.0, base_interval + random.uniform(-jitter, jitter))
 
+    discovered_str = (
+        f" | Discovered limit: {DISCOVERED_MAX_SEARCHES}/hr"
+        if DISCOVERED_MAX_SEARCHES is not None
+        else " | Probing max limit..."
+    )
     print(
-        f"[Rate Pacer] Rolling hour usage: {len(SEARCH_TIMESTAMPS)}/{max_per_hour} searches "
+        f"[Rate Pacer] Rolling 60m: {len(SEARCH_TIMESTAMPS)}/{max_per_hour} searches "
+        f"(Session: {TOTAL_SUCCESSFUL_SEARCHES}){discovered_str} "
         f"| Next search in {delay:.1f}s (~{3600.0 / base_interval:.0f}/hr pace)"
     )
     return delay
@@ -412,8 +792,13 @@ DATE_REGEX = re.compile(
 
 def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) -> bool:
     """Types a postcode/search query into the search input box and clicks 'Find test centres'."""
+    global START_EXECUTION_STEP, TOTAL_SUCCESSFUL_SEARCHES, SEARCHES_SINCE_LAST_LIMIT, LAST_LIMIT_HIT_TIME
+
     wait_for_security_check_resolution(bridge)
     handle_search_limit_if_present(bridge)
+
+    if START_EXECUTION_STEP is None:
+        START_EXECUTION_STEP = get_execution_step(bridge)
 
     if query is not None:
         input_getter = """
@@ -465,11 +850,41 @@ def run_postcode_search(bridge: ChromeCDPBridge, query: Optional[str] = None) ->
             return False
 
     click_target(bridge, btn_coords, label="Find test centres")
-    SEARCH_TIMESTAMPS.append(time.time())
+    attempt_ts = time.time()
     time.sleep(config.PAGE_TRANSITION_DELAY)
     wait_for_security_check_resolution(bridge)
     if handle_search_limit_if_present(bridge):
         return False
+
+    # Search succeeded without hitting the limit modal
+    SEARCH_TIMESTAMPS.append(attempt_ts)
+    prune_search_timestamps(attempt_ts)
+    TOTAL_SUCCESSFUL_SEARCHES += 1
+    SEARCHES_SINCE_LAST_LIMIT += 1
+    cur_step = get_execution_step(bridge)
+    step_delta = (cur_step - START_EXECUTION_STEP) if (cur_step and START_EXECUTION_STEP) else 0
+
+    if LAST_LIMIT_HIT_TIME is not None:
+        recovery_sec = attempt_ts - LAST_LIMIT_HIT_TIME
+        print(
+            f"[LIMIT RECOVERED] Searches working again after {recovery_sec / 60.0:.1f}m ({recovery_sec:.0f}s) "
+            f"| Rolling 60m count: {len(SEARCH_TIMESTAMPS)}"
+        )
+        log_telemetry_event(
+            "search_limit_recovered",
+            {
+                "recovery_seconds": round(recovery_sec, 1),
+                "rolling_60m_searches": len(SEARCH_TIMESTAMPS),
+                "execution_step": cur_step,
+            },
+        )
+        LAST_LIMIT_HIT_TIME = None
+
+    print(
+        f"[Search OK #{TOTAL_SUCCESSFUL_SEARCHES}] Query: '{query or 'current'}' "
+        f"| 60m Window: {len(SEARCH_TIMESTAMPS)} | Since last limit: {SEARCHES_SINCE_LAST_LIMIT} "
+        f"| URL State: e1s{cur_step} (+{step_delta})"
+    )
     return True
 
 
@@ -698,6 +1113,128 @@ def handle_calendar_and_slot_flow(bridge: ChromeCDPBridge) -> bool:
     return True
 
 
+def fill_candidate_details_and_submit(bridge: ChromeCDPBridge, submit: bool = True) -> bool:
+    """Executes Step 6 ('Your details') candidate details form automation:
+    1. Waits for the 'Your details' form (#details-suffix, #details-first-names) to load
+    2. Selects Title ('Mr') from #details-suffix
+    3. Fills First names, Surname, Address line 1, Town, Postcode, Email, Confirm email, Contact number
+    4. Clicks 'Next: payment details' (#details-submit)
+    """
+    if not CANDIDATE_DETAILS:
+        print("[WARN] candidate_details.py is missing or empty; skipping auto-fill.")
+        return False
+
+    print(f"[Step 4.1] Waiting up to {config.ELEMENT_WAIT_TIMEOUT:.0f}s for 'Your details' form to load...")
+    form_getter = """
+    document.querySelector('#details-suffix, select[name="title"], #details-first-names, input[name="firstName"]')
+    """
+    if not bridge.wait_for_coords(form_getter, timeout=config.ELEMENT_WAIT_TIMEOUT):
+        print("[WARN] Could not find 'Your details' form on the page (timed out).")
+        return False
+
+    # 1. Select Title dropdown (#details-suffix / select[name="title"])
+    title_val = CANDIDATE_DETAILS.get("title", "Mr")
+    if title_val:
+        title_getter = "document.querySelector('#details-suffix, select[name=\"title\"]')"
+        title_coords = bridge.scroll_into_view_and_get_coords(title_getter)
+        if title_coords:
+            click_target(bridge, title_coords, label=f"Title Dropdown ('{title_val}')")
+            time.sleep(0.1)
+            title_json = json.dumps(title_val)
+            bridge.evaluate(
+                f"""
+                (() => {{
+                    const sel = document.querySelector('#details-suffix, select[name="title"]');
+                    if (!sel) return false;
+                    sel.value = {title_json};
+                    sel.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return true;
+                }})()
+                """
+            )
+            time.sleep(0.15)
+
+    # 2. Fill text/email/tel inputs in order
+    field_mappings = [
+        ("First names", "#details-first-names, input[name=\"firstName\"]", CANDIDATE_DETAILS.get("first_names", "")),
+        ("Surname", "#details-surname, input[name=\"surname\"]", CANDIDATE_DETAILS.get("surname", "")),
+        ("Address line 1", "#details-address-1, input[name=\"addressLine1\"]", CANDIDATE_DETAILS.get("address_line_1", "")),
+        ("Address line 2", "#details-address-2, input[name=\"addressLine2\"]", CANDIDATE_DETAILS.get("address_line_2", "")),
+        ("Town", "#details-town, input[name=\"town\"]", CANDIDATE_DETAILS.get("town", "")),
+        ("Postcode", "#details-postcode, input[name=\"postcode\"]", CANDIDATE_DETAILS.get("postcode", "")),
+        ("Email address", "#details-email, input[name=\"emailAddress\"]", CANDIDATE_DETAILS.get("email", "")),
+        (
+            "Confirm email address",
+            "#details-confirm-email, input[name=\"confirmEmailAddress\"]",
+            CANDIDATE_DETAILS.get("confirm_email", CANDIDATE_DETAILS.get("email", "")),
+        ),
+        ("Contact number", "#details-contact-number, input[name=\"contactNumber\"]", CANDIDATE_DETAILS.get("contact_number", "")),
+    ]
+
+    for label, selector, value in field_mappings:
+        if not value:
+            continue
+        sel_json = json.dumps(selector)
+        val_json = json.dumps(value)
+        getter = f"document.querySelector({sel_json})"
+        coords = bridge.scroll_into_view_and_get_coords(getter)
+        if not coords:
+            print(f"[WARN] Could not find input field for {label} ({selector}).")
+            continue
+
+        click_target(bridge, coords, label=f"{label}")
+        if getattr(config, "USE_PHYSICAL_MOUSE", False):
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.04)
+            pyautogui.press("backspace")
+            pyautogui.write(value, interval=0.025)
+        else:
+            bridge.evaluate(
+                f"""
+                (() => {{
+                    const el = document.querySelector({sel_json});
+                    if (el) {{ el.focus(); el.value = ''; }}
+                }})()
+                """
+            )
+            time.sleep(0.04)
+            bridge.cdp_type_text(value)
+
+        # Ensure exact value and fire input/change/blur events for DVSA validation
+        bridge.evaluate(
+            f"""
+            (() => {{
+                const el = document.querySelector({sel_json});
+                if (!el) return;
+                if (el.value !== {val_json}) el.value = {val_json};
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+            }})()
+            """
+        )
+        time.sleep(0.1)
+
+    if not submit:
+        print("[Step 4.2] Candidate details filled (submit=False).")
+        return True
+
+    # 3. Click 'Next: payment details' (#details-submit)
+    submit_getter = """
+    document.querySelector('#details-submit, input[name="detailsSubmit"], input[type="submit"].cta, button[type="submit"]')
+    """
+    submit_coords = bridge.wait_for_coords(submit_getter, timeout=config.ELEMENT_WAIT_TIMEOUT)
+    if not submit_coords:
+        print("[WARN] Could not find 'Next: payment details' (#details-submit) button.")
+        return False
+
+    click_target(bridge, submit_coords, label=f"Next: payment details ('{submit_coords['text']}')")
+    notify_audible(urgent=True)
+    print("[SUCCESS] Submitted 'Your details' form! Reached Step 7 ('Card details' / payment).")
+    return True
+
+
 def evaluate_date_action(location: str, day: int, month: int, year: int) -> str:
     """Returns 'book', 'notify', or 'ignore' for a location and parsed (day, month, year)."""
     if location in getattr(config, "ACCEPT_ANY_DATE_LOCATIONS", []):
@@ -733,7 +1270,8 @@ def check_current_results(bridge: ChromeCDPBridge) -> bool:
             notify_audible(urgent=True)
             if click_location(bridge, loc):
                 if handle_calendar_and_slot_flow(bridge):
-                    print("[SUCCESS] Reached the next form page! Stopping bot for manual handling.")
+                    fill_candidate_details_and_submit(bridge, submit=True)
+                    print("[SUCCESS] Booking flow reached payment page! Stopping bot for manual payment.")
                     return True
         elif action == "notify":
             print(f"[MATCH - NOTIFY ONLY] {loc} has tests around {date_str} (01/2027)")
@@ -743,6 +1281,43 @@ def check_current_results(bridge: ChromeCDPBridge) -> bool:
     return False
 
 
+def wait_until_test_centre_page_ready(bridge: ChromeCDPBridge) -> None:
+    """If Chrome was just launched via start_chrome.bat (e.g. on New Tab or login screen),
+    waits quietly until the DVSA 'Test centre' page is open before starting the search loop.
+    Also detects if the tab is currently on an Error 15 block page and runs the 15/30/60m cooldown.
+    """
+    ready_script = """
+    Boolean(document.querySelector('#test-centres-input, #test-centres-submit, a.test-centre-details-link'))
+    """
+    if is_error_15_block_page(bridge):
+        wait_for_error_15_resolution(bridge)
+
+    try:
+        if bridge.evaluate(ready_script):
+            return
+    except Exception:
+        pass
+
+    print(
+        "\n[Waiting] Please navigate to the DVSA 'Test centre' page in the Chrome window.\n"
+        "          The bot will start monitoring automatically as soon as the page is loaded..."
+    )
+    while True:
+        time.sleep(2.0)
+        if not bridge.is_tab_open():
+            print("\n[INFO] Chrome tab/window was closed by user. Exiting bot cleanly.")
+            sys.exit(0)
+        if is_error_15_block_page(bridge):
+            wait_for_error_15_resolution(bridge)
+        try:
+            if bridge.evaluate(ready_script):
+                print("[Ready] DVSA 'Test centre' page detected! Starting search loop...\n")
+                time.sleep(0.5)
+                return
+        except Exception:
+            pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hybrid Chrome CDP Booking Bot")
     parser.add_argument(
@@ -750,19 +1325,36 @@ def main() -> None:
         action="store_true",
         help="Immediately test clicking the earliest calendar date, latest time slot, and Continue on the currently open 'Test time' page.",
     )
+    parser.add_argument(
+        "--test-details",
+        action="store_true",
+        help="Immediately test filling Step 6 ('Your details') candidate details form on the currently open page.",
+    )
+    parser.add_argument(
+        "--no-submit",
+        action="store_true",
+        help="When used with --test-details, fills all candidate fields without clicking the final 'Next: payment details' submit button.",
+    )
     args = parser.parse_args()
 
     bridge = ChromeCDPBridge()
-    bridge.connect()
+    bridge.connect(auto_launch=True)
 
     mode_str = "Physical Mouse (PyAutoGUI)" if getattr(config, "USE_PHYSICAL_MOUSE", False) else "100% Cursor-Free (CDP Native Input)"
     print(f"[Mode] {mode_str} | Target Pace: {config.MAX_SEARCHES_PER_HOUR} searches/hour")
 
     if args.test_calendar:
         print("[TEST MODE] Running calendar + time slot + continue flow on current page...")
-        handle_calendar_and_slot_flow(bridge)
+        if handle_calendar_and_slot_flow(bridge):
+            fill_candidate_details_and_submit(bridge, submit=not args.no_submit)
         return
 
+    if args.test_details:
+        print("[TEST MODE] Running Step 6 ('Your details') form auto-fill on current page...")
+        fill_candidate_details_and_submit(bridge, submit=not args.no_submit)
+        return
+
+    wait_until_test_centre_page_ready(bridge)
     print("Monitoring locations for availability...")
     if check_current_results(bridge):
         return
