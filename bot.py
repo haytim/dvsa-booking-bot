@@ -1,3 +1,31 @@
+"""Hybrid Browser UI Automation Case Study (Chrome DevTools Protocol + PyAutoGUI).
+
+===============================================================================
+EDUCATIONAL & TECHNICAL RESEARCH DISCLAIMER
+===============================================================================
+This codebase is an archived software engineering proof-of-concept and research
+case study exploring:
+  1. Hybrid browser automation via Chrome DevTools Protocol (CDP) viewport
+     coordinate projection (`Input.dispatchMouseEvent`) vs. OS-level virtual
+     desktop coordinate mapping (`window.devicePixelRatio`, `PyAutoGUI`).
+  2. Client-side rate-pacing and Spring Web Flow state-transition telemetry.
+  3. Automated UI testing against saved offline HTML form snapshots.
+
+IMPORTANT LEGAL & ACCEPTABLE USE NOTICE:
+  - Automated scraping, polling, or booking on live Driver and Vehicle
+    Standards Agency (DVSA) systems is prohibited by the DVSA Terms and
+    Conditions and Acceptable Use Policy.
+  - This software is published strictly for educational, academic, and
+    portfolio demonstration purposes and is NOT intended to be used by
+    individuals against live DVSA infrastructure.
+  - This software explicitly does NOT bypass or automate CAPTCHA or security
+    access controls; execution immediately halts whenever a security challenge
+    is detected.
+  - By default, `config.DRY_RUN = True` is enabled so that live booking
+    transitions are disabled out-of-the-box.
+===============================================================================
+"""
+
 import argparse
 import collections
 from datetime import datetime
@@ -20,7 +48,10 @@ import config
 try:
     from candidate_details import CANDIDATE_DETAILS
 except ImportError:
-    CANDIDATE_DETAILS = {}
+    try:
+        from candidate_details_example import CANDIDATE_DETAILS  # type: ignore
+    except ImportError:
+        CANDIDATE_DETAILS = {}
 
 # Enable PyAutoGUI fail-safe (if USE_PHYSICAL_MOUSE is enabled)
 pyautogui.FAILSAFE = True
@@ -783,7 +814,7 @@ def compute_smart_poll_delay() -> float:
     return delay
 
 
-# Matches e.g. "Dundee – available tests around 03/03/2027" (even if the dash is mangled as \ufffd)
+# Matches e.g. "Edinburgh (Currie) – available tests around 03/03/2027" (even if the dash is mangled as \ufffd)
 DATE_REGEX = re.compile(
     r"avai?li?able\s+tests\s+around\s+(\d{2})/(\d{2})/(\d{4})",
     re.IGNORECASE,
@@ -1216,8 +1247,8 @@ def fill_candidate_details_and_submit(bridge: ChromeCDPBridge, submit: bool = Tr
         )
         time.sleep(0.1)
 
-    if not submit:
-        print("[Step 4.2] Candidate details filled (submit=False).")
+    if not submit or getattr(config, "DRY_RUN", True):
+        print("[Step 4.2] Candidate details filled (skipping final submit in DRY_RUN / --no-submit mode).")
         return True
 
     # 3. Click 'Next: payment details' (#details-submit)
@@ -1268,13 +1299,18 @@ def check_current_results(bridge: ChromeCDPBridge) -> bool:
         if action == "book":
             print(f"[MATCH - AUTO BOOK] {loc} has tests around {date_str}!")
             notify_audible(urgent=True)
+            if getattr(config, "DRY_RUN", True):
+                print(
+                    f"[DRY RUN] config.DRY_RUN=True — skipping live booking transition for {loc} ({date_str})."
+                )
+                continue
             if click_location(bridge, loc):
                 if handle_calendar_and_slot_flow(bridge):
                     fill_candidate_details_and_submit(bridge, submit=True)
                     print("[SUCCESS] Booking flow reached payment page! Stopping bot for manual payment.")
                     return True
         elif action == "notify":
-            print(f"[MATCH - NOTIFY ONLY] {loc} has tests around {date_str} (01/2027)")
+            print(f"[MATCH - NOTIFY ONLY] {loc} has tests around {date_str}")
             notify_audible(urgent=False)
         else:
             print(f"[INFO] {loc}: available around {date_str} (outside target months)")
